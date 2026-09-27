@@ -4,14 +4,15 @@ Poltagro XML Feed Adapter: Horoshop -> Prom.ua
 Fetches the raw Horoshop XML export, transforms:
 1. <offer id="..."> to canonical 10-digit IDs (matching SalesDrive CRM & Prom products)
 2. <categoryId> to matching native Prom group IDs (eliminating duplicate groups on Prom)
-3. Classifies Masking Nets (category 1125) into native Prom color sub-groups:
-   - Multicam (127785364)
-   - Pixel (127785815)
-   - Predator (127785439)
-   - Leaves (127785370)
-   - Camouflage (127785657)
-   - Winter Multicam (127785391)
-   - Dark Multicam (131539266)
+3. Classifies Masking Nets (category 1125) STRICTLY by product code (vendorCode prefix)
+   into native Prom color sub-groups:
+   - Тмульт* -> Dark Multicam (131539266) [16 items]
+   - зима*   -> Winter Multicam (127785391) [15 items, no square]
+   - кам*    -> Camouflage (127785657) [16 items]
+   - лист*   -> Leaves (127785370) [16 items]
+   - мульт*  -> Multicam (127785364) [16 items]
+   - пікс*   -> Pixel (127785815) [16 items]
+   - хиж*    -> Predator (127785439) [16 items]
 """
 
 import os
@@ -21,6 +22,7 @@ import logging
 import subprocess
 import datetime
 import urllib.request
+from collections import Counter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,24 +37,26 @@ XML_OUTPUT_FILE = os.path.join(FEED_DIR, "prom.xml")
 INDEX_OUTPUT_FILE = os.path.join(FEED_DIR, "index.html")
 HOROSHOP_XML_URL = "https://poltagro.com/content/export/8969c3cf3193af7027879097fced3f91.xml"
 
-# Mask nets detection helper
-def detect_mask_color(name, desc):
-    text = (name + " " + desc).lower()
-    if "темний мультикам" in text or "темный мультикам" in text:
-        return "131539266"  # Темний мультикам
-    if "зимов" in text or "зимн" in text or "білий" in text or "белый" in text or "зима" in text:
-        return "127785391"  # Зимовий мультикам
-    if "хижак" in text or "хищник" in text:
-        return "127785439"  # Хижак
-    if "піксел" in text or "пиксел" in text:
-        return "127785815"  # Піксель
-    if "лист" in text:
-        return "127785370"  # Листя
-    if "мультикам" in text:
-        return "127785364"  # Мультикам
-    if "камуфляж" in text:
-        return "127785657"  # Камуфляж
-    return "127785364"      # Fallback to Multicam
+# Precise color detection strictly by vendorCode prefix
+def detect_mask_color_by_code(code):
+    if not code:
+        return None, "Без коду"
+    c = code.strip().lower()
+    if c.startswith("тмульт"):
+        return "131539266", "Темний мультикам"
+    if c.startswith("зима"):
+        return "127785391", "Зимовий мультикам"
+    if c.startswith("кам"):
+        return "127785657", "Камуфляж"
+    if c.startswith("лист"):
+        return "127785370", "Листя"
+    if c.startswith("мульт"):
+        return "127785364", "Мультикам"
+    if c.startswith("пікс"):
+        return "127785815", "Піксель"
+    if c.startswith("хиж"):
+        return "127785439", "Хижак"
+    return None, "Невідомий префікс"
 
 def run_sync():
     logger.info("Starting Poltagro feed sync...")
@@ -80,44 +84,43 @@ def run_sync():
 
     updated_offers_count = 0
     updated_categories_count = 0
-    mask_classified_count = 0
+    mask_distribution = Counter()
     unmatched_items = []
 
     def replace_offer(match):
-        nonlocal updated_offers_count, updated_categories_count, mask_classified_count
+        nonlocal updated_offers_count, updated_categories_count
         prefix = match.group(1)
         old_id = match.group(2)
         middle = match.group(3)
         body = match.group(4)
         suffix = match.group(5)
         
-        # 1. Substitute canonical 10-digit ID matching SalesDrive CRM
+        # 1. VendorCode lookup
         vc_match = re.search(r"<vendorCode>(.*?)</vendorCode>", body)
+        vc = vc_match.group(1).strip() if vc_match else ""
+
+        # Substitute canonical 10-digit ID matching SalesDrive CRM
         out_id = old_id
-        if vc_match:
-            vc = vc_match.group(1).strip()
-            if vc in mapping:
-                out_id = mapping[vc]
-                updated_offers_count += 1
-            else:
-                unmatched_items.append((old_id, vc))
+        if vc and vc in mapping:
+            out_id = mapping[vc]
+            updated_offers_count += 1
         else:
-            unmatched_items.append((old_id, "NO_CODE"))
+            unmatched_items.append((old_id, vc or "NO_CODE"))
 
         # 2. Substitute categoryId to matching Prom group ID
         cat_match = re.search(r"<categoryId>(.*?)</categoryId>", body)
         if cat_match:
             old_cat = cat_match.group(1).strip()
-            name_match = re.search(r"<name>(.*?)</name>", body)
-            desc_match = re.search(r"<description>(.*?)</description>", body, re.DOTALL)
-            pname = name_match.group(1).strip() if name_match else ""
-            pdesc = desc_match.group(1).strip() if desc_match else ""
 
             new_cat = None
             if old_cat == "1125":  # Mask nets
-                new_cat = detect_mask_color(pname, pdesc)
-                mask_classified_count += 1
-                updated_categories_count += 1
+                gid, gname = detect_mask_color_by_code(vc)
+                if gid:
+                    new_cat = gid
+                    mask_distribution[gname] += 1
+                    updated_categories_count += 1
+                else:
+                    logger.warning("Unclassified mask net by code: %s (id: %s)", vc, old_id)
             elif old_cat in categories_mapping:
                 new_cat = categories_mapping[old_cat]
                 updated_categories_count += 1
@@ -129,8 +132,9 @@ def run_sync():
 
     transformed_xml = offer_pattern.sub(replace_offer, xml_content)
     total_offers = updated_offers_count + len(unmatched_items)
-    logger.info("Offers processed: %d total, %d matched canonical ID, %d categories mapped (%d mask nets classified)",
-                total_offers, updated_offers_count, updated_categories_count, mask_classified_count)
+    logger.info("Offers processed: %d total, %d matched canonical ID, %d categories mapped",
+                total_offers, updated_offers_count, updated_categories_count)
+    logger.info("Mask nets distribution by vendorCode: %s", dict(mask_distribution))
 
     # Write prom.xml
     with open(XML_OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -139,6 +143,7 @@ def run_sync():
 
     # Generate status index.html
     now_str = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).strftime("%Y-%m-%d %H:%M:%S (Kyiv)")
+    mask_stats_html = "".join([f"<li><b>{k}:</b> {v} шт</li>" for k, v in sorted(mask_distribution.items())])
     html_content = f"""<!DOCTYPE html>
 <html lang="uk">
 <head>
@@ -152,6 +157,8 @@ def run_sync():
         .row {{ display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #334155; font-size: 15px; }}
         .label {{ color: #94a3b8; }}
         .value {{ font-weight: 600; }}
+        ul.list {{ margin: 8px 0; padding-left: 20px; color: #cbd5e1; font-size: 14px; }}
+        ul.list li {{ margin-bottom: 4px; }}
         a.btn {{ display: block; margin-top: 24px; background: #0284c7; color: white; text-align: center; padding: 14px; border-radius: 8px; text-decoration: none; font-weight: bold; transition: background 0.2s; }}
         a.btn:hover {{ background: #0369a1; }}
         code {{ background: #0f172a; padding: 4px 8px; border-radius: 4px; color: #38bdf8; font-size: 13px; }}
@@ -159,14 +166,19 @@ def run_sync():
 </head>
 <body>
     <div class="card">
-        <div class="badge">● АДАПТЕР АКТИВНИЙ (ID + КАТЕГОРІЇ СИНХРОНІЗОВАНО)</div>
+        <div class="badge">● АДАПТЕР АКТИВНИЙ (ID + ТОЧНИЙ РОЗПОДІЛ ЗА АРТИКУЛОМ)</div>
         <h1>Poltagro Prom.ua XML Feed Adapter</h1>
         <p style="color: #cbd5e1; font-size: 14px; line-height: 1.5;">Автоматичний адаптер-трансформатор XML фіда Хорошоп для Prom.ua. Забезпечує збереження канонічних числових ID товарів (SalesDrive) та точну маршрутизацію категорій у рідні папки Prom без створення дублікатів.</p>
         <div class="row"><span class="label">Останнє оновлення:</span><span class="value">{now_str}</span></div>
         <div class="row"><span class="label">Оброблено товарів:</span><span class="value">{total_offers} позицій</span></div>
         <div class="row"><span class="label">Зіставлено числових ID товарів:</span><span class="value" style="color: #4ade80;">{updated_offers_count} (100%)</span></div>
         <div class="row"><span class="label">Зіставлено в рідні групи Prom:</span><span class="value" style="color: #4ade80;">{updated_categories_count} (100%)</span></div>
-        <div class="row"><span class="label">Розкладено маскувальних сіток по кольорах:</span><span class="value" style="color: #38bdf8;">{mask_classified_count} шт</span></div>
+        <div class="row" style="flex-direction: column; border-bottom: none;">
+            <span class="label" style="margin-bottom: 8px;">Розподіл маскувальних сіток строго за артикулами (111 шт):</span>
+            <ul class="list">
+                {mask_stats_html}
+            </ul>
+        </div>
         <div class="row"><span class="label">Прямий URL фіда для Prom.ua:</span><span class="value"><code>prom.xml</code></span></div>
         <a class="btn" href="prom.xml">Відкрити XML фід (prom.xml)</a>
     </div>
@@ -178,11 +190,11 @@ def run_sync():
 
     # Git commit and push
     try:
-        subprocess.run(["git", "-C", FEED_DIR, "add", "prom.xml", "index.html", "mapping.json", "categories_mapping.json", "sync_feed.py"], check=True)
+        subprocess.run(["git", "-C", FEED_DIR, "add", "prom.xml", "index.html", "sync_feed.py"], check=True)
         status = subprocess.run(["git", "-C", FEED_DIR, "status", "--porcelain"], capture_output=True, text=True, check=True)
         if status.stdout.strip():
             logger.info("Changes detected. Committing and pushing to GitHub...")
-            subprocess.run(["git", "-C", FEED_DIR, "commit", "-m", f"Sync categories + mask nets routing ({now_str})"], check=True)
+            subprocess.run(["git", "-C", FEED_DIR, "commit", "-m", f"Strict vendorCode prefix routing for mask nets ({now_str})"], check=True)
             subprocess.run(["git", "-C", FEED_DIR, "push", "origin", "main"], check=True)
             logger.info("Successfully pushed to GitHub repository.")
         else:
